@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GPS Plotter</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
+#map{position:absolute;inset:0}
+.bar{position:absolute;left:0;right:0;z-index:1000;padding:8px;display:flex;gap:6px;flex-wrap:wrap;background:rgba(17,17,17,.88)}
+#top{top:0;padding-top:calc(8px + env(safe-area-inset-top,0px))}
+#bot{bottom:0;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))}
+button,select{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+button.primary{background:#1a73e8;border-color:#1a73e8;font-weight:600;flex:1 1 100%}
+button.on{background:#2e7d32;border-color:#2e7d32}
+button.danger{color:#ff8a80}
+#info{font-size:13px;flex:1 1 100%;line-height:1.4}
+#calc{position:absolute;z-index:1100;left:8px;right:8px;top:calc(60px + env(safe-area-inset-top,0px));max-height:55%;overflow:auto;background:rgba(17,17,17,.95);border:1px solid #444;border-radius:10px;padding:10px;display:none;font-size:13px;line-height:1.5}
+#calc h4{margin:10px 0 2px;color:#ffeb3b}#calc h4:first-of-type{margin-top:0}
+#calc .r{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #2a2a2a}
+#calc .x{float:right;padding:4px 10px}
+label{display:flex;align-items:center;gap:4px;font-size:13px}
+</style></head><body>
+<div id="map"></div>
+<div id="calc"></div>
+<div class="bar" id="top">
+  <select id="mode"><option value="point">Point</option><option value="line">Line</option><option value="polygon">Polygon</option></select>
+  <select id="base"></select>
+  <button id="track">GPS: off</button>
+  <label><input type="checkbox" id="follow" checked>Follow</label>
+  <label><input type="checkbox" id="tap">Tap map</label>
+</div>
+<div class="bar" id="bot">
+  <div id="info">Turn GPS on to start.</div>
+  <button class="primary" id="add">📍 Add my position</button>
+  <button id="finish">Finish shape</button>
+  <button id="undo">Undo</button>
+  <button id="calcbtn">Calculate</button>
+  <button id="export">Export GeoJSON</button>
+  <button id="clear" class="danger">Clear all</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const map=L.map('map',{zoomControl:false}).setView([-6.6,106.8],13);
+const bases={
+ 'Google Satellite':L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',{maxZoom:21,attribution:'© Google'}),
+ 'Google Hybrid':L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',{maxZoom:21,attribution:'© Google'}),
+ 'Esri Imagery':L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'© Esri'}),
+ 'OpenStreetMap':L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'})
+};
+let cur;
+Object.keys(bases).forEach(k=>$('base').add(new Option(k,k)));
+function setBase(k){if(cur)map.removeLayer(cur);cur=bases[k].addTo(map)}
+$('base').onchange=e=>setBase(e.target.value);setBase('Google Satellite');
+
+const done=L.featureGroup().addTo(map);
+let saved=[];            // {type,coords:[[lat,lng]]}
+let pts=[], draft=L.featureGroup().addTo(map);
+let pos=null, watchId=null, me=null, acc=null;
+
+const style={color:'#ffeb3b',weight:3,fillOpacity:.25};
+function dist(a,b){const R=6371008.8,r=Math.PI/180,dl=(b[0]-a[0])*r,dn=(b[1]-a[1])*r;
+ const h=Math.sin(dl/2)**2+Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+function length(c){let s=0;for(let i=1;i<c.length;i++)s+=dist(c[i-1],c[i]);return s}
+function area(c){if(c.length<3)return 0;const R=6371008.8,r=Math.PI/180,la=c[0][0]*r;
+ const p=c.map(q=>[(q[1]-c[0][1])*r*R*Math.cos(la),(q[0]-c[0][0])*r*R]);let s=0;
+ for(let i=0;i<p.length;i++){const j=(i+1)%p.length;s+=p[i][0]*p[j][1]-p[j][0]*p[i][1]}return Math.abs(s)/2}
+const fm=m=>m>=1000?(m/1000).toFixed(2)+' km':m.toFixed(1)+' m';
+const fa=a=>a>=1e4?(a/1e4).toFixed(2)+' ha':a.toFixed(1)+' m²';
+
+function draw(){
+ draft.clearLayers();const m=$('mode').value;
+ pts.forEach(p=>L.circleMarker(p,{radius:5,color:'#ff5722',fillOpacity:1}).addTo(draft));
+ if(m!=='point'&&pts.length>1)(m==='polygon'&&pts.length>2?L.polygon(pts,{...style,dashArray:'6 4'}):L.polyline(pts,{...style,dashArray:'6 4'})).addTo(draft);
+ stats();
+}
+function stats(){
+ const m=$('mode').value;let t=pos?`GPS ±${Math.round(pos.acc)} m · ${pos.lat.toFixed(6)}, ${pos.lng.toFixed(6)}<br>`:'Waiting for GPS…<br>';
+ t+=`${saved.length} saved · drawing ${pts.length} vertices`;
+ if(m==='line'&&pts.length>1)t+=` · ${fm(length(pts))}`;
+ if(m==='polygon'&&pts.length>2)t+=` · ${fa(area(pts))}, perimeter ${fm(length([...pts,pts[0]]))}`;
+ $('info').innerHTML=t;
+}
+function commit(type,c){
+ saved.push({type,coords:c});
+ if(type==='point')L.marker(c[0]).bindPopup(c[0].map(v=>v.toFixed(6)).join(', ')).addTo(done);
+ else if(type==='line')L.polyline(c,style).bindPopup(fm(length(c))).addTo(done);
+ else L.polygon(c,style).bindPopup(fa(area(c))).addTo(done);
+}
+function addVertex(ll){
+ if($('mode').value==='point'){commit('point',[ll]);pts=[]}else pts.push(ll);
+ draw();
+}
+$('add').onclick=()=>{if(!pos)return alert('No GPS fix yet. Turn GPS on and wait for a position.');addVertex([pos.lat,pos.lng])};
+map.on('click',e=>{if($('tap').checked)addVertex([e.latlng.lat,e.latlng.lng])});
+$('finish').onclick=()=>{const m=$('mode').value;
+ if(m==='line'&&pts.length>=2)commit('line',pts);
+ else if(m==='polygon'&&pts.length>=3)commit('polygon',pts);
+ else return alert(m==='line'?'A line needs 2+ points.':m==='polygon'?'A polygon needs 3+ points.':'Points save instantly.');
+ pts=[];draw()};
+$('undo').onclick=()=>{pts.pop();draw()};
+$('mode').onchange=()=>{pts=[];draw()};
+$('clear').onclick=()=>{if(confirm('Delete all shapes?')){saved=[];pts=[];done.clearLayers();draw()}};
+
+$('export').onclick=()=>{
+ const gj={type:'FeatureCollection',features:saved.map((s,i)=>({type:'Feature',properties:{id:i+1,type:s.type},
+  geometry:s.type==='point'?{type:'Point',coordinates:[s.coords[0][1],s.coords[0][0]]}
+  :s.type==='line'?{type:'LineString',coordinates:s.coords.map(c=>[c[1],c[0]])}
+  :{type:'Polygon',coordinates:[[...s.coords,s.coords[0]].map(c=>[c[1],c[0]])]}}))};
+ const b=new Blob([JSON.stringify(gj,null,2)],{type:'application/geo+json'});
+ const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='plot-'+Date.now()+'.geojson';a.click();
+};
+
+$('track').onclick=()=>{
+ if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null;$('track').textContent='GPS: off';$('track').classList.remove('on');return}
+ if(!navigator.geolocation)return alert('Geolocation not supported. Open over HTTPS.');
+ $('track').textContent='GPS: on';$('track').classList.add('on');
+ let first=true;
+ watchId=navigator.geolocation.watchPosition(p=>{
+  pos={lat:p.coords.latitude,lng:p.coords.longitude,acc:p.coords.accuracy};
+  const ll=[pos.lat,pos.lng];
+  if(!me){me=L.circleMarker(ll,{radius:8,color:'#fff',fillColor:'#1a73e8',fillOpacity:1,weight:3}).addTo(map);acc=L.circle(ll,{radius:pos.acc,color:'#1a73e8',weight:1,fillOpacity:.1}).addTo(map)}
+  else{me.setLatLng(ll);acc.setLatLng(ll).setRadius(pos.acc)}
+  if(first){map.setView(ll,19);first=false}else if($('follow').checked)map.panTo(ll);
+  stats();
+ },e=>{$('info').textContent='GPS error: '+e.message},{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+};
+// ---- Calculations ----
+const eCache={};const ek=c=>c[0].toFixed(5)+','+c[1].toFixed(5);
+async function getElev(coords){
+ const need=[...new Set(coords.map(ek))].filter(k=>!(k in eCache));
+ for(let i=0;i<need.length;i+=100){
+  const ch=need.slice(i,i+100).map(k=>k.split(','));
+  const r=await fetch('https://api.open-meteo.com/v1/elevation?latitude='+ch.map(c=>c[0]).join(',')+'&longitude='+ch.map(c=>c[1]).join(','));
+  if(!r.ok)throw new Error('Elevation service error');
+  const d=await r.json();ch.forEach((c,j)=>eCache[c.join(',')]=d.elevation[j]);
+ }
+ return coords.map(c=>eCache[ek(c)]);
+}
+const row=(a,b)=>`<div class="r"><span>${a}</span><b>${b}</b></div>`;
+function elevRows(e,withGain){
+ const mn=Math.min(...e),mx=Math.max(...e),av=e.reduce((a,b)=>a+b,0)/e.length;
+ let t=row('Elevation min / max',mn.toFixed(1)+' / '+mx.toFixed(1)+' m')+row('Elevation avg',av.toFixed(1)+' m')+row('Relief (max − min)',(mx-mn).toFixed(1)+' m');
+ if(withGain){let g=0,l=0;for(let i=1;i<e.length;i++){const d=e[i]-e[i-1];d>0?g+=d:l-=d}
+  t+=row('Total gain / loss','+'+g.toFixed(1)+' / −'+l.toFixed(1)+' m')+row('Net change',(e[e.length-1]-e[0]).toFixed(1)+' m')}
+ return t;
+}
+async function describe(s,title){
+ let h=`<h4>${title}</h4>`,c=s.coords;
+ if(s.type==='point')h+=row('Coordinates',c[0][0].toFixed(6)+', '+c[0][1].toFixed(6));
+ if(s.type==='line'){const L=length(c);h+=row('Vertices',c.length)+row('Length',fm(L));}
+ if(s.type==='polygon')h+=row('Vertices',c.length)+row('Area',fa(area(c))+' ('+area(c).toFixed(1)+' m²)')+row('Perimeter',fm(length([...c,c[0]])));
+ try{const e=await getElev(c);
+  if(s.type==='point')h+=row('Elevation',e[0].toFixed(1)+' m');
+  else{h+=elevRows(e,s.type==='line');
+   if(s.type==='line'){const L=length(c);if(L>0)h+=row('Avg slope (net)',((e[e.length-1]-e[0])/L*100).toFixed(1)+' %')}}
+ }catch(err){h+=row('Elevation','unavailable (needs internet)')}
+ return h;
+}
+$('calcbtn').onclick=async()=>{
+ const box=$('calc');box.style.display='block';box.innerHTML='<button class="x" onclick="this.parentNode.style.display=\'none\'">Close</button>Calculating…';
+ const items=saved.map((s,i)=>[s,`#${i+1} ${s.type}`]);
+ const m=$('mode').value;
+ if(pts.length&&m!=='point')items.push([{type:m,coords:pts},'Current drawing (unfinished)']);
+ if(!items.length){box.innerHTML+='<br>Nothing to calculate yet. Plot a shape first.';return}
+ let out='<button class="x" onclick="this.parentNode.style.display=\'none\'">Close</button>';
+ for(const [s,t] of items)out+=await describe(s,t);
+ out+='<div style="margin-top:8px;color:#999">Elevation comes from a ~90 m terrain model (Open-Meteo), so expect a few metres of error. Area and length are geodesic approximations.</div>';
+ box.innerHTML=out;
+};
+draw();
+</script></body></html>
